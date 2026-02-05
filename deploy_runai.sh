@@ -11,11 +11,46 @@ echo "=== RunAI Prerequisites Installer ==="
 
 # 1. Start MicroK8s (fix containerd if needed)
 echo "[1/10] Checking MicroK8s..."
-if ! microk8s status 2>/dev/null | grep -q "is running"; then
+
+# Fix containerd configs (both MicroK8s and system)
+fix_containerd() {
+  # Fix MicroK8s containerd configs
   sudo sed -i 's/^disabled_plugins = \["cri"\]/# disabled_plugins = ["cri"]/' /var/snap/microk8s/current/args/containerd*.toml 2>/dev/null || true
-  microk8s start && sleep 10
+  # Fix system containerd config (conflicts with MicroK8s)
+  if [ -f /etc/containerd/config.toml ]; then
+    sudo sed -i 's/^disabled_plugins = \["cri"\]/# disabled_plugins = ["cri"]/' /etc/containerd/config.toml 2>/dev/null || true
+    # If file only has bad config, replace with minimal valid config
+    if grep -q 'disabled_plugins = \["cri"\]' /etc/containerd/config.toml 2>/dev/null; then
+      echo "version = 2" | sudo tee /etc/containerd/config.toml > /dev/null
+    fi
+  fi
+}
+
+# Apply fix preemptively
+fix_containerd
+
+# Try to start, retry with fix if fails
+if ! microk8s status 2>/dev/null | grep -q "is running"; then
+  echo "Starting MicroK8s..."
+  if ! microk8s start 2>/dev/null; then
+    echo "Start failed, applying containerd fix and retrying..."
+    fix_containerd
+    microk8s start
+  fi
+  sleep 10
 fi
-kubectl wait --for=condition=ready node --all --timeout=120s
+
+# Wait for node to be ready
+echo "Waiting for Kubernetes to be ready..."
+for i in {1..30}; do
+  if kubectl get nodes 2>/dev/null | grep -q " Ready"; then
+    echo "Node is ready!"
+    break
+  fi
+  echo "Waiting... ($i/30)"
+  sleep 5
+done
+kubectl wait --for=condition=ready node --all --timeout=120s 2>/dev/null || true
 
 # 2. Install Helm
 echo "[2/10] Checking Helm..."
@@ -80,8 +115,38 @@ kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1
 kubectl wait --for=condition=ready pod -l app=controller -n knative-serving --timeout=120s 2>/dev/null || true
 kubectl patch configmap/config-features -n knative-serving --type merge -p '{"data":{"kubernetes.podspec-schedulername":"enabled","kubernetes.podspec-nodeselector":"enabled","kubernetes.podspec-affinity":"enabled","kubernetes.podspec-tolerations":"enabled","multi-container":"enabled"}}' 2>/dev/null || true
 
-# 9. Add Helm repo
-echo "[9/9] Adding RunAI repo..."
+# 9. Configure CoreDNS
+echo "[9/10] Configuring DNS..."
+INGRESS_IP=$(kubectl get svc -n ingress-nginx -o jsonpath="{.items[0].spec.clusterIP}" 2>/dev/null || echo "10.152.183.1")
+kubectl apply -f - <<COREDNS
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        ready
+        hosts {
+           ${INGRESS_IP} ${DOMAIN}
+           fallthrough
+        }
+        kubernetes cluster.local in-addr.arpa ip6.arpa { pods insecure; fallthrough in-addr.arpa ip6.arpa; ttl 30; }
+        prometheus :9153
+        forward . /etc/resolv.conf
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+COREDNS
+kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || true
+
+# 10. Add Helm repo
+echo "[10/10] Adding RunAI repo..."
 helm repo add runai-backend https://runai.jfrog.io/artifactory/cp-charts-prod 2>/dev/null || true
 helm repo update
 
