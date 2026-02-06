@@ -1,15 +1,15 @@
 # RunAI Self-Hosted Deployment on Brev
 
-Deploy Run:AI control plane and cluster on a single GPU node using Brev.
+Deploy the Run:AI control plane **and** register the local cluster on a single GPU node using Brev.
 
 ## Overview
 
 This guide walks you through deploying RunAI on a Brev launchable instance. The deployment consists of:
 
-1. **Prerequisites Setup** - Automated via `deploy_runai.sh`
-2. **Control Plane Installation** - Manual helm command with your JFrog token
-3. **Local Access Configuration** - Configure your machine to access the UI
-4. **Cluster Registration** - Add the cluster via the RunAI UI
+1. **Prerequisites Setup** - Automated via `deploy_runai_prereqs.sh`
+2. **Set JFrog token** - You export your Run:AI JFrog token
+3. **Deploy RunAI** - Automated via `deploy_runai.sh` (registry secret → control plane → add cluster)
+4. **Local Access Configuration** - Configure your machine to access the UI
 5. **CLI Installation** - Optional command-line tools
 
 ---
@@ -38,9 +38,9 @@ export RUNAI_DOMAIN="runai.brev.cloud"
 # Optional: Set RunAI version (default: 2.24.37)
 export RUNAI_VERSION="2.24.37"
 
-# Run the installer
-chmod +x deploy_runai.sh
-./deploy_runai.sh
+# Run the prerequisites installer
+chmod +x deploy_runai_prereqs.sh
+./deploy_runai_prereqs.sh
 ```
 
 This script will:
@@ -59,34 +59,38 @@ Get your JFrog token from Run:AI support, then:
 export RUNAI_JFROG_TOKEN="eyJ2ZXIiOiIyIi..."  # Your full token here
 ```
 
-### Step 4: Create Registry Secret
+### Step 4: Deploy RunAI (control plane + add cluster)
 
 ```bash
-kubectl create secret docker-registry runai-reg-creds -n runai-backend \
-  --docker-server=runai.jfrog.io \
-  --docker-username=self-hosted-image-puller-prod \
-  --docker-password="${RUNAI_JFROG_TOKEN}" \
-  --docker-email=support@run.ai
+chmod +x deploy_runai.sh
+./deploy_runai.sh
 ```
 
-### Step 5: Install RunAI Control Plane
+What `deploy_runai.sh` does:
+- Creates the JFrog registry pull secret in `runai-backend`
+- Installs/updates the Run:AI control plane via Helm
+- Calls the control plane API to create/register the local cluster
+- Installs the cluster components using the returned Helm install string (and injects the custom CA flag)
+
+Optional variables you can override:
 
 ```bash
-helm upgrade -i runai-backend runai-backend/control-plane -n runai-backend \
-  --version "2.24.37" \
-  --set global.domain=${RUNAI_DOMAIN:-runai.local} \
-  --set global.customCA.enabled=true \
-  --set-file global.customCA.caPEM=/tmp/runai-certs/ca.crt \
-  --set global.imagePullSecrets[0].name=runai-reg-creds \
-  --wait --timeout=20m
+# Control plane UI/API host (defaults to RUNAI_DOMAIN)
+export RUNAI_CONTROL_PLANE_DOMAIN="${RUNAI_DOMAIN}"
+
+# Cluster registration info
+export RUNAI_CLUSTER_NAME="brev-cluster"
+export RUNAI_CLUSTER_VERSION="${RUNAI_VERSION}"
+
+# Credentials for the initial admin (defaults shown)
+export RUNAI_USERNAME="test@run.ai"
+export RUNAI_PASSWORD="Abcd!234"
+
+# If you *didn't* trust the CA on the instance, you can force curl -k:
+export RUNAI_CURL_INSECURE=1
 ```
 
-Monitor the deployment:
-```bash
-kubectl get pods -n runai-backend -w
-```
-
-### Step 6: Configure Local Access
+### Step 5: Configure Local Access
 
 On your **local computer**, add the server to your hosts file:
 
@@ -95,7 +99,7 @@ On your **local computer**, add the server to your hosts file:
 echo "YOUR_PUBLIC_IP runai.brev.cloud" | sudo tee -a /etc/hosts
 ```
 
-### Step 7: Access RunAI UI
+### Step 6: Access RunAI UI
 
 Open in your browser: **https://runai.brev.cloud** (or your custom domain)
 
@@ -105,21 +109,7 @@ Default credentials:
 
 > **SSL Warning?** Install the CA certificate from `~/runai-ca.crt` in your browser.
 
-### Step 8: Add Cluster to RunAI
-
-1. In the RunAI UI, navigate to **Settings > Clusters**
-2. Click **New Cluster**
-3. Follow the wizard and copy the provided helm command
-4. Run the command on your server, **adding the CA cert flag**:
-
-```bash
-# Example (use the actual command from the UI):
-helm install runai-cluster runai/runai-cluster -n runai \
-  --set ... \
-  --set-file customCA.caPEM=/tmp/runai-certs/ca.crt
-```
-
-### Step 9: Install RunAI CLI (Optional)
+### Step 7: Install RunAI CLI (Optional)
 
 ```bash
 wget https://github.com/run-ai/runai-cli/releases/latest/download/runai-cli-linux-amd64 -O runai
@@ -136,10 +126,11 @@ runai config set cluster-url https://runai.brev.cloud
 
 ```
 .
-├── deploy_runai.sh      # Prerequisites installer script
-├── readme.md            # This file
-├── INSTRUCTIONS.md      # Generated after running deploy_runai.sh
-└── runai-ca.crt         # Generated CA certificate (copy to local machine if needed)
+├── deploy_runai_prereqs.sh   # Prereqs: k8s health + ingress + certs + Prometheus + Knative
+├── deploy_runai.sh           # Deploy: registry secret + control plane + add/register cluster
+├── README.md                 # This file
+├── INSTRUCTIONS.md           # Generated after running deploy_runai_prereqs.sh
+└── runai-ca.crt              # Generated CA certificate (copy to local machine if needed)
 ```
 
 ---

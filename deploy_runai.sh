@@ -1,184 +1,216 @@
-#!/bin/bash
-# RunAI Prerequisites Installer
-set -e
+#!/usr/bin/env bash
+# RunAI deployment script (run on the Brev instance *after* setting RUNAI_JFROG_TOKEN)
+set -euo pipefail
 
-DOMAIN="${RUNAI_DOMAIN:-runai.local}"
-VERSION="${RUNAI_VERSION:-2.24.37}"
-PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "YOUR_PUBLIC_IP")
-CERT_DIR=/tmp/runai-certs
+RUNAI_DOMAIN="${RUNAI_DOMAIN:-runai.local}"
+RUNAI_VERSION="${RUNAI_VERSION:-2.24.37}"
+RUNAI_CERT_DIR="${RUNAI_CERT_DIR:-/tmp/runai-certs}"
 
-echo "=== RunAI Prerequisites Installer ==="
+RUNAI_CONTROL_PLANE_DOMAIN="${RUNAI_CONTROL_PLANE_DOMAIN:-$RUNAI_DOMAIN}"
+RUNAI_CLUSTER_NAME="${RUNAI_CLUSTER_NAME:-brev-cluster}"
+RUNAI_CLUSTER_VERSION="${RUNAI_CLUSTER_VERSION:-$RUNAI_VERSION}"
 
-# 1. Start MicroK8s (fix containerd if needed)
-echo "[1/10] Checking MicroK8s..."
+RUNAI_USERNAME="${RUNAI_USERNAME:-test@run.ai}"
+RUNAI_PASSWORD="${RUNAI_PASSWORD:-Abcd!234}"
 
-# Fix containerd configs (both MicroK8s and system)
-fix_containerd() {
-  # Fix MicroK8s containerd configs
-  sudo sed -i 's/^disabled_plugins = \["cri"\]/# disabled_plugins = ["cri"]/' /var/snap/microk8s/current/args/containerd*.toml 2>/dev/null || true
-  # Fix system containerd config (conflicts with MicroK8s)
-  if [ -f /etc/containerd/config.toml ]; then
-    sudo sed -i 's/^disabled_plugins = \["cri"\]/# disabled_plugins = ["cri"]/' /etc/containerd/config.toml 2>/dev/null || true
-    # If file only has bad config, replace with minimal valid config
-    if grep -q 'disabled_plugins = \["cri"\]' /etc/containerd/config.toml 2>/dev/null; then
-      echo "version = 2" | sudo tee /etc/containerd/config.toml > /dev/null
+RUNAI_BACKEND_NAMESPACE="${RUNAI_BACKEND_NAMESPACE:-runai-backend}"
+RUNAI_CLUSTER_NAMESPACE="${RUNAI_CLUSTER_NAMESPACE:-runai}"
+
+RUNAI_REGISTRY_SERVER="${RUNAI_REGISTRY_SERVER:-runai.jfrog.io}"
+RUNAI_REGISTRY_USERNAME="${RUNAI_REGISTRY_USERNAME:-self-hosted-image-puller-prod}"
+RUNAI_REGISTRY_EMAIL="${RUNAI_REGISTRY_EMAIL:-support@run.ai}"
+RUNAI_REGISTRY_SECRET_NAME="${RUNAI_REGISTRY_SECRET_NAME:-runai-reg-creds}"
+
+# Set to 1 to force curl -k (if you did not install the CA on the instance)
+RUNAI_CURL_INSECURE="${RUNAI_CURL_INSECURE:-0}"
+
+log() { echo "[$(date +'%H:%M:%S')] $*"; }
+warn() { echo "[$(date +'%H:%M:%S')] WARN: $*" >&2; }
+die() { echo "[$(date +'%H:%M:%S')] ERROR: $*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+k() {
+  if have microk8s; then
+    microk8s kubectl "$@"
+  else
+    kubectl "$@"
+  fi
+}
+
+curl_flags=()
+if [[ "${RUNAI_CURL_INSECURE}" == "1" ]]; then
+  curl_flags+=("--insecure")
+fi
+
+ensure_deps() {
+  have curl || die "curl is required"
+  have helm || die "helm is required (run ./deploy_runai_prereqs.sh first)"
+
+  if ! have jq; then
+    if have apt-get; then
+      log "Installing jq..."
+      sudo apt-get update -y >/dev/null
+      sudo apt-get install -y jq >/dev/null
+    else
+      die "jq is required (install jq or use an image that includes it)"
     fi
   fi
 }
 
-# Apply fix preemptively
-fix_containerd
-
-# Try to start, retry with fix if fails
-if ! microk8s status 2>/dev/null | grep -q "is running"; then
-  echo "Starting MicroK8s..."
-  if ! microk8s start 2>/dev/null; then
-    echo "Start failed, applying containerd fix and retrying..."
-    fix_containerd
-    microk8s start
+ensure_token() {
+  if [[ -z "${RUNAI_JFROG_TOKEN:-}" ]]; then
+    die "RUNAI_JFROG_TOKEN is not set. Export it first, then re-run this script."
   fi
-  sleep 10
-fi
+}
 
-# Wait for node to be ready
-echo "Waiting for Kubernetes to be ready..."
-for i in {1..30}; do
-  if kubectl get nodes 2>/dev/null | grep -q " Ready"; then
-    echo "Node is ready!"
-    break
+ensure_namespaces() {
+  k create ns "${RUNAI_BACKEND_NAMESPACE}" >/dev/null 2>&1 || true
+  k create ns "${RUNAI_CLUSTER_NAMESPACE}" >/dev/null 2>&1 || true
+}
+
+create_registry_secret() {
+  log "Creating registry secret (${RUNAI_REGISTRY_SECRET_NAME})..."
+  k delete secret "${RUNAI_REGISTRY_SECRET_NAME}" -n "${RUNAI_BACKEND_NAMESPACE}" >/dev/null 2>&1 || true
+
+  k create secret docker-registry "${RUNAI_REGISTRY_SECRET_NAME}" -n "${RUNAI_BACKEND_NAMESPACE}" \
+    --docker-server="${RUNAI_REGISTRY_SERVER}" \
+    --docker-username="${RUNAI_REGISTRY_USERNAME}" \
+    --docker-password="${RUNAI_JFROG_TOKEN}" \
+    --docker-email="${RUNAI_REGISTRY_EMAIL}"
+}
+
+install_control_plane() {
+  local ca_path="${RUNAI_CERT_DIR}/ca.crt"
+  [[ -f "${ca_path}" ]] || die "CA cert not found at ${ca_path}. Did you run ./deploy_runai_prereqs.sh?"
+
+  log "Ensuring RunAI helm repo is available..."
+  helm repo add runai-backend https://runai.jfrog.io/artifactory/cp-charts-prod >/dev/null 2>&1 || true
+  helm repo update >/dev/null 2>&1 || true
+
+  log "Installing RunAI control plane (version ${RUNAI_VERSION})..."
+  helm upgrade -i runai-backend runai-backend/control-plane -n "${RUNAI_BACKEND_NAMESPACE}" \
+    --version "${RUNAI_VERSION}" \
+    --set "global.domain=${RUNAI_DOMAIN}" \
+    --set "global.customCA.enabled=true" \
+    --set-file "global.customCA.caPEM=${ca_path}" \
+    --set "global.imagePullSecrets[0].name=${RUNAI_REGISTRY_SECRET_NAME}" \
+    --wait --timeout=25m
+
+  log "Control plane install complete."
+}
+
+obtain_access_token() {
+  # Prints access token to stdout
+  local domain="${RUNAI_CONTROL_PLANE_DOMAIN}"
+
+  log "Obtaining authentication token..."
+  curl -fsS "${curl_flags[@]}" \
+    --location \
+    --request POST "https://${domain}/auth/realms/runai/protocol/openid-connect/token" \
+    --header 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'grant_type=password' \
+    --data-urlencode 'client_id=runai' \
+    --data-urlencode "username=${RUNAI_USERNAME}" \
+    --data-urlencode "password=${RUNAI_PASSWORD}" \
+    --data-urlencode 'scope=openid' \
+    --data-urlencode 'response_type=id_token' \
+    | jq -r .access_token
+}
+
+create_cluster() {
+  # Prints UUID to stdout
+  local token="$1"
+  local domain="${RUNAI_CONTROL_PLANE_DOMAIN}"
+
+  log "Creating cluster in RunAI Control Plane..."
+  local response
+  response="$(curl -fsS "${curl_flags[@]}" \
+    -X POST "https://${domain}/api/v1/clusters" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -H "accept: application/json" \
+    -d "{
+      \"name\": \"${RUNAI_CLUSTER_NAME}\",
+      \"version\": \"${RUNAI_CLUSTER_VERSION}\",
+      \"domain\": \"${domain}\"
+    }")"
+
+  echo "${response}" | jq -r .uuid
+}
+
+get_installation_string() {
+  # Prints installationStr to stdout
+  local token="$1"
+  local uuid="$2"
+  local domain="${RUNAI_CONTROL_PLANE_DOMAIN}"
+
+  log "Retrieving cluster installation string..."
+  curl -fsS "${curl_flags[@]}" \
+    "https://${domain}/api/v1/clusters/${uuid}/cluster-install-info?version=${RUNAI_CLUSTER_VERSION}" \
+    -H 'accept: application/json' \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    | jq -r .installationStr
+}
+
+install_cluster_from_string() {
+  local installationStr="$1"
+  local ca_path="${RUNAI_CERT_DIR}/ca.crt"
+  [[ -f "${ca_path}" ]] || die "CA cert not found at ${ca_path}"
+
+  log "Installing cluster into Kubernetes..."
+
+  # Convert the multi-line UI string into a single helm command.
+  local evalStr
+  evalStr="$(echo "${installationStr}" \
+    | sed '1,2d' \
+    | sed ':a;N;$!ba;s/\n/ /g' \
+    | sed 's/upgrade -i/install/g' \
+    | tr '\\' ' ')"
+
+  if [[ ! "${evalStr}" =~ ^helm[[:space:]] ]]; then
+    die "Invalid installation command format (expected helm command). Got: ${evalStr}"
   fi
-  echo "Waiting... ($i/30)"
-  sleep 5
-done
-kubectl wait --for=condition=ready node --all --timeout=120s 2>/dev/null || true
 
-# 2. Install Helm
-echo "[2/10] Checking Helm..."
-command -v helm &>/dev/null || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  # Ensure we include the custom CA flag for the cluster chart.
+  if [[ "${evalStr}" != *"customCA.caPEM"* ]]; then
+    evalStr="${evalStr} --set-file customCA.caPEM=${ca_path}"
+  fi
 
-# 3. Install Ingress (hostNetwork for port 443 access)
-echo "[3/10] Installing Ingress..."
-kubectl create ns ingress-nginx 2>/dev/null || true
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/null || true
-helm upgrade -i ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx \
-  --set controller.kind=DaemonSet --set controller.hostNetwork=true \
-  --set controller.dnsPolicy=ClusterFirstWithHostNet --set controller.service.type=ClusterIP \
-  --set controller.admissionWebhooks.enabled=false --wait --timeout=3m
+  log "Executing: ${evalStr}"
+  eval "${evalStr}"
+}
 
-# Verify port 443 is listening
-echo "Verifying port 443..."
-sleep 5
-ss -tlnp | grep -q ":443" && echo "Port 443 is listening" || echo "Warning: Port 443 not detected"
+main() {
+  log "=== RunAI deploy (control plane + add cluster) ==="
+  log "Domain: ${RUNAI_DOMAIN}"
+  log "Control-plane domain: ${RUNAI_CONTROL_PLANE_DOMAIN}"
+  log "Cluster: ${RUNAI_CLUSTER_NAME} (version ${RUNAI_CLUSTER_VERSION})"
 
-# 4. Create namespaces
-echo "[4/10] Creating namespaces..."
-kubectl create ns runai-backend 2>/dev/null || true
-kubectl create ns runai 2>/dev/null || true
+  ensure_deps
+  ensure_token
+  ensure_namespaces
 
-# 5. Generate TLS certs
-echo "[5/10] Generating certificates..."
-rm -rf $CERT_DIR && mkdir -p $CERT_DIR && cd $CERT_DIR
-openssl req -x509 -new -nodes -days 3650 -newkey rsa:4096 -keyout ca.key -out ca.crt -subj "/CN=RunAI CA" 2>/dev/null
-openssl req -new -nodes -newkey rsa:2048 -keyout server.key -out server.csr -subj "/CN=${DOMAIN}" 2>/dev/null
-echo "basicConstraints=CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=DNS:${DOMAIN},DNS:*.${DOMAIN}" > server.ext
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext 2>/dev/null
-cat server.crt ca.crt > bundle.crt
-sudo cp ca.crt /usr/local/share/ca-certificates/runai-ca.crt && sudo update-ca-certificates 2>/dev/null
-cp ca.crt ~/runai-ca.crt
+  create_registry_secret
+  install_control_plane
 
-# 6. Create K8s secrets
-echo "[6/10] Creating secrets..."
-kubectl delete secret runai-backend-tls runai-ca-cert -n runai-backend 2>/dev/null || true
-kubectl delete secret runai-ca-cert -n runai 2>/dev/null || true
-kubectl create secret tls runai-backend-tls -n runai-backend --cert=bundle.crt --key=server.key
-kubectl create secret generic runai-ca-cert -n runai-backend --from-file=runai-ca.pem=ca.crt
-kubectl create secret generic runai-ca-cert -n runai --from-file=runai-ca.pem=ca.crt
+  local token
+  token="$(obtain_access_token)"
+  [[ -n "${token}" && "${token}" != "null" ]] || die "Failed to obtain access token (check RUNAI_USERNAME/RUNAI_PASSWORD and control plane readiness)."
 
-# 7. Install Prometheus
-echo "[7/10] Installing Prometheus..."
-kubectl create ns monitoring 2>/dev/null || true
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
-helm upgrade -i prometheus prometheus-community/kube-prometheus-stack -n monitoring \
-  --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
-  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-  --wait --timeout=5m
+  local uuid
+  uuid="$(create_cluster "${token}")"
+  [[ -n "${uuid}" && "${uuid}" != "null" ]] || die "Failed to create cluster (uuid missing)."
 
-# 8. Install Knative
-echo "[8/10] Installing Knative..."
-kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.18.2/serving-crds.yaml 2>/dev/null || true
-sleep 3
-kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.18.2/serving-core.yaml 2>/dev/null || true
-kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.18.2/serving-hpa.yaml 2>/dev/null || true
-kubectl wait --for=condition=ready pod -l app=controller -n knative-serving --timeout=120s 2>/dev/null || true
-kubectl patch configmap/config-features -n knative-serving --type merge -p '{"data":{"kubernetes.podspec-schedulername":"enabled","kubernetes.podspec-nodeselector":"enabled","kubernetes.podspec-affinity":"enabled","kubernetes.podspec-tolerations":"enabled","multi-container":"enabled"}}' 2>/dev/null || true
+  local installationStr
+  installationStr="$(get_installation_string "${token}" "${uuid}")"
+  [[ -n "${installationStr}" && "${installationStr}" != "null" ]] || die "Failed to retrieve installation string."
 
-# 9. Configure CoreDNS
-echo "[9/10] Configuring DNS..."
-INGRESS_IP=$(kubectl get svc -n ingress-nginx -o jsonpath="{.items[0].spec.clusterIP}" 2>/dev/null || echo "10.152.183.1")
-kubectl apply -f - <<COREDNS
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: coredns
-  namespace: kube-system
-data:
-  Corefile: |
-    .:53 {
-        errors
-        health
-        ready
-        hosts {
-           ${INGRESS_IP} ${DOMAIN}
-           fallthrough
-        }
-        kubernetes cluster.local in-addr.arpa ip6.arpa { pods insecure; fallthrough in-addr.arpa ip6.arpa; ttl 30; }
-        prometheus :9153
-        forward . /etc/resolv.conf
-        cache 30
-        loop
-        reload
-        loadbalance
-    }
-COREDNS
-kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || true
+  install_cluster_from_string "${installationStr}"
 
-# 10. Add Helm repo
-echo "[10/10] Adding RunAI repo..."
-helm repo add runai-backend https://runai.jfrog.io/artifactory/cp-charts-prod 2>/dev/null || true
-helm repo update
+  log "Done."
+  log "Open the UI: https://${RUNAI_DOMAIN}"
+}
 
-# Generate instructions
-cat > ~/INSTRUCTIONS.md <<EOF
-# RunAI Setup Instructions
-Public IP: ${PUBLIC_IP} | Domain: ${DOMAIN}
-
-## 1. Set JFrog Token
-export RUNAI_JFROG_TOKEN="your-token-here"
-
-## 2. Create Registry Secret
-kubectl create secret docker-registry runai-reg-creds -n runai-backend \\
-  --docker-server=runai.jfrog.io --docker-username=self-hosted-image-puller-prod \\
-  --docker-password="\${RUNAI_JFROG_TOKEN}" --docker-email=support@run.ai
-
-## 3. Install Control Plane
-helm upgrade -i runai-backend runai-backend/control-plane -n runai-backend \\
-  --version "${VERSION}" --set global.domain=${DOMAIN} \\
-  --set global.customCA.enabled=true --set-file global.customCA.caPEM=${CERT_DIR}/ca.crt \\
-  --set global.imagePullSecrets[0].name=runai-reg-creds --wait --timeout=20m
-
-## 4. Local Access (run on YOUR computer)
-echo "${PUBLIC_IP} ${DOMAIN}" | sudo tee -a /etc/hosts
-
-## 5. Open UI: https://${DOMAIN}
-Login: test@run.ai / Abcd!234
-
-## 6. Add Cluster (from UI, add this flag):
---set-file customCA.caPEM=${CERT_DIR}/ca.crt
-EOF
-
-echo ""
-echo "=== Done! Read ~/INSTRUCTIONS.md for next steps ==="
-echo "cat ~/INSTRUCTIONS.md"
+main "$@"
