@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # RunAI prerequisites installer (run on the Brev instance)
 set -euo pipefail
 

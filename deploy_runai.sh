@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # RunAI deployment script (run on the Brev instance *after* setting RUNAI_JFROG_TOKEN)
 set -euo pipefail
 
