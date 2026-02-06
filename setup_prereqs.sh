@@ -2,7 +2,7 @@
 # Runs automatically on instance creation. Sets up everything needed before the user gets access.
 set -euo pipefail
 
-DOMAIN="${RUNAI_DOMAIN:-runai.local}"
+DOMAIN="${RUNAI_DOMAIN:-runai.brev.cloud}"
 VERSION="${RUNAI_VERSION:-2.24.37}"
 CERT_DIR="${RUNAI_CERT_DIR:-/tmp/runai-certs}"
 

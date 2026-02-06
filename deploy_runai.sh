@@ -2,7 +2,7 @@
 # Installs RunAI control plane + cluster. Run after setting RUNAI_JFROG_TOKEN.
 set -euo pipefail
 
-RUNAI_DOMAIN="${RUNAI_DOMAIN:-runai.local}"
+RUNAI_DOMAIN="${RUNAI_DOMAIN:-runai.brev.cloud}"
 RUNAI_VERSION="${RUNAI_VERSION:-2.24.37}"
 RUNAI_CERT_DIR="${RUNAI_CERT_DIR:-/tmp/runai-certs}"
 RUNAI_CLUSTER_NAME="${RUNAI_CLUSTER_NAME:-brev-cluster}"

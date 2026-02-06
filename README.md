@@ -21,10 +21,10 @@ This creates the registry secret, installs the control plane, creates a cluster,
 **3. On your local machine**, add the hosts entry printed at the end:
 
 ```bash
-echo "YOUR_PUBLIC_IP runai.local" | sudo tee -a /etc/hosts
+echo "YOUR_PUBLIC_IP runai.brev.cloud" | sudo tee -a /etc/hosts
 ```
 
-**4. Open** https://runai.local — login: `test@run.ai` / `Abcd!234`
+**4. Open** https://runai.brev.cloud — login: `test@run.ai` / `Abcd!234`
 
 ## Configuration
 
@@ -32,7 +32,7 @@ Set these before running `deploy_runai.sh` if you need non-default values:
 
 | Variable | Default |
 |---|---|
-| `RUNAI_DOMAIN` | `runai.local` |
+| `RUNAI_DOMAIN` | `runai.brev.cloud` |
 | `RUNAI_VERSION` | `2.24.37` |
 | `RUNAI_CLUSTER_NAME` | `brev-cluster` |
 
