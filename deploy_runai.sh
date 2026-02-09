@@ -63,16 +63,28 @@ token=$(curl -fsS "${curl_flags[@]}" --location \
   --data-urlencode 'response_type=id_token' | jq -r .access_token)
 [[ -n "${token}" && "${token}" != "null" ]] || die "Failed to get auth token."
 
-# --- Create cluster ---
+# --- Create or find cluster ---
 log "Creating cluster '${RUNAI_CLUSTER_NAME}'..."
-response=$(curl -fsS "${curl_flags[@]}" \
+create_response=$(curl -sS "${curl_flags[@]}" -w "\n%{http_code}" \
   -X POST "https://${RUNAI_DOMAIN}/api/v1/clusters" \
   -H "Authorization: Bearer ${token}" \
   -H "Content-Type: application/json" \
   -H "accept: application/json" \
   -d "{\"name\":\"${RUNAI_CLUSTER_NAME}\",\"version\":\"${RUNAI_VERSION}\",\"domain\":\"${RUNAI_DOMAIN}\"}")
-uuid=$(echo "${response}" | jq -r .uuid)
-[[ -n "${uuid}" && "${uuid}" != "null" ]] || die "Failed to create cluster."
+http_code=$(echo "${create_response}" | tail -1)
+body=$(echo "${create_response}" | sed '$d')
+
+if [[ "${http_code}" == "409" ]]; then
+  log "Cluster already exists, looking up UUID..."
+  uuid=$(curl -fsS "${curl_flags[@]}" \
+    "https://${RUNAI_DOMAIN}/api/v1/clusters" \
+    -H "Authorization: Bearer ${token}" \
+    -H "accept: application/json" \
+    | jq -r ".[] | select(.name==\"${RUNAI_CLUSTER_NAME}\") | .uuid")
+else
+  uuid=$(echo "${body}" | jq -r .uuid)
+fi
+[[ -n "${uuid}" && "${uuid}" != "null" ]] || die "Failed to create or find cluster."
 log "Cluster UUID: ${uuid}"
 
 # --- Install cluster ---
@@ -87,6 +99,10 @@ installationStr=$(curl -fsS "${curl_flags[@]}" \
 evalStr=$(echo "${installationStr}" | sed '1,2d' | sed ':a;N;$!ba;s/\n/ /g' | sed 's/upgrade -i/install/g' | tr '\\' ' ')
 [[ "${evalStr}" =~ ^helm[[:space:]] ]] || die "Invalid install command: ${evalStr}"
 [[ "${evalStr}" == *"customCA.caPEM"* ]] || evalStr="${evalStr} --set-file customCA.caPEM=${RUNAI_CERT_DIR}/ca.crt"
+
+# Ensure the cluster chart repo exists
+helm repo add runai https://runai.jfrog.io/artifactory/self-hosted-charts-prod 2>/dev/null || true
+helm repo update >/dev/null 2>&1
 
 log "Installing cluster..."
 eval "${evalStr}"

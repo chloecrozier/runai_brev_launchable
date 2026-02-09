@@ -8,25 +8,12 @@ CERT_DIR="${RUNAI_CERT_DIR:-/tmp/runai-certs}"
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
 
-# --- Fix containerd and start MicroK8s ---
-log "Fixing containerd..."
+# --- Fix containerd (just in case) and verify k8s is up ---
 sudo sed -i 's/^disabled_plugins = \["cri"\]/# disabled_plugins = ["cri"]/' \
   /var/snap/microk8s/current/args/containerd*.toml 2>/dev/null || true
-if [ -f /etc/containerd/config.toml ]; then
-  sudo sed -i 's/^disabled_plugins = \["cri"\]/# disabled_plugins = ["cri"]/' \
-    /etc/containerd/config.toml 2>/dev/null || true
-fi
 
-log "Waiting for MicroK8s..."
-for i in $(seq 1 60); do
-  microk8s status 2>/dev/null | grep -q "is running" && break
-  microk8s start 2>/dev/null || true
-  sleep 5
-done
-microk8s status --wait-ready --timeout 300
-
-log "Waiting for node Ready..."
-kubectl wait --for=condition=ready node --all --timeout=300s
+log "Verifying k8s is ready..."
+kubectl wait --for=condition=ready node --all --timeout=60s
 
 # --- Helm ---
 log "Installing Helm..."
@@ -122,9 +109,10 @@ data:
 COREDNS
 kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || true
 
-# --- RunAI Helm repo ---
-log "Adding RunAI Helm repo..."
+# --- RunAI Helm repos ---
+log "Adding RunAI Helm repos..."
 helm repo add runai-backend https://runai.jfrog.io/artifactory/cp-charts-prod 2>/dev/null || true
+helm repo add runai https://runai.jfrog.io/artifactory/self-hosted-charts-prod 2>/dev/null || true
 helm repo update
 
 log "Prerequisites ready."
