@@ -4,7 +4,8 @@
 
 ## Prerequisites
 
-Port **443** must be open on the server instance (for the ingress controller).
+- Brev instance with at least **24 CPUs**
+- Port **443** open on the instance
 
 ## Deploy RunAI
 
@@ -26,7 +27,7 @@ export RUNAI_JFROG_TOKEN="your-token-here"
 sudo bash -c 'echo "YOUR_PUBLIC_IP runai.brev.cloud" >> /etc/hosts'
 ```
 
-**4. Open** https://runai.brev.cloud and accept the cert warning (in Chrome, type `thisisunsafe` on the warning page).
+**4. Open** https://runai.brev.cloud and accept the self-signed cert warning.
 
 **5. Login:** `test@run.ai` / `Abcd!234`
 
