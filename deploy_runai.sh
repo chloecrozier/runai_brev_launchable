@@ -96,13 +96,20 @@ installationStr=$(curl -fsS "${curl_flags[@]}" \
   -H 'Content-Type: application/json' | jq -r .installationStr)
 [[ -n "${installationStr}" && "${installationStr}" != "null" ]] || die "Failed to get install string."
 
-evalStr=$(echo "${installationStr}" | sed '1,2d' | sed ':a;N;$!ba;s/\n/ /g' | sed 's/upgrade -i/install/g' | tr '\\' ' ')
+evalStr=$(echo "${installationStr}" | sed '1,2d' | sed ':a;N;$!ba;s/\n/ /g' | tr '\\' ' ')
+# Normalize to "helm upgrade --install" so re-runs don't fail with "name still in use"
+evalStr=$(echo "${evalStr}" | sed -E 's/helm (upgrade -i|upgrade --install|install) /helm upgrade --install /g')
 [[ "${evalStr}" =~ ^helm[[:space:]] ]] || die "Invalid install command: ${evalStr}"
-[[ "${evalStr}" == *"customCA.caPEM"* ]] || evalStr="${evalStr} --set-file customCA.caPEM=${RUNAI_CERT_DIR}/ca.crt"
 
-# Ensure the cluster chart repo exists
-helm repo add runai https://runai.jfrog.io/artifactory/self-hosted-charts-prod 2>/dev/null || true
-helm repo update >/dev/null 2>&1
+# The cluster chart reads the CA from secret runai-ca-cert (already created by setup_prereqs).
+# We just need to flip the feature on; the secret name/key defaults match what we created.
+[[ "${evalStr}" == *"global.customCA.enabled"* ]] || evalStr="${evalStr} --set global.customCA.enabled=true"
+
+# Ensure the cluster chart repo exists (JFrog requires auth for cluster charts)
+log "Adding RunAI cluster Helm repo..."
+helm repo add runai https://runai.jfrog.io/artifactory/api/helm/run-ai-charts --force-update \
+  || die "Failed to add runai Helm repo. Check RUNAI_JFROG_TOKEN and network."
+helm repo update || die "Failed to update Helm repos."
 
 log "Installing cluster..."
 eval "${evalStr}"

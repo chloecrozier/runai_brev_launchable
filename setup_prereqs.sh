@@ -33,23 +33,28 @@ log "Creating namespaces..."
 kubectl create ns runai-backend 2>/dev/null || true
 kubectl create ns runai 2>/dev/null || true
 
-# --- TLS certs ---
-log "Generating TLS certificates..."
-rm -rf "${CERT_DIR}" && mkdir -p "${CERT_DIR}" && cd "${CERT_DIR}"
-openssl req -x509 -new -nodes -days 3650 -newkey rsa:4096 -keyout ca.key -out ca.crt -subj "/CN=RunAI CA" 2>/dev/null
-openssl req -new -nodes -newkey rsa:2048 -keyout server.key -out server.csr -subj "/CN=${DOMAIN}" 2>/dev/null
-cat > server.ext <<EOF
+# --- TLS certs (skip if already generated) ---
+if [[ -f "${CERT_DIR}/ca.crt" && -f "${CERT_DIR}/bundle.crt" && -f "${CERT_DIR}/server.key" ]]; then
+  log "TLS certificates already exist at ${CERT_DIR}, skipping generation."
+  cd "${CERT_DIR}"
+else
+  log "Generating TLS certificates..."
+  rm -rf "${CERT_DIR}" && mkdir -p "${CERT_DIR}" && cd "${CERT_DIR}"
+  openssl req -x509 -new -nodes -days 3650 -newkey rsa:4096 -keyout ca.key -out ca.crt -subj "/CN=RunAI CA" 2>/dev/null
+  openssl req -new -nodes -newkey rsa:2048 -keyout server.key -out server.csr -subj "/CN=${DOMAIN}" 2>/dev/null
+  cat > server.ext <<EOF
 basicConstraints=CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth,clientAuth
 subjectAltName=DNS:${DOMAIN},DNS:*.${DOMAIN}
 EOF
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext 2>/dev/null
-cat server.crt ca.crt > bundle.crt
-sudo cp ca.crt /usr/local/share/ca-certificates/runai-ca.crt && sudo update-ca-certificates 2>/dev/null || true
-cp ca.crt ~/runai-ca.crt
+  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext 2>/dev/null
+  cat server.crt ca.crt > bundle.crt
+  sudo cp ca.crt /usr/local/share/ca-certificates/runai-ca.crt && sudo update-ca-certificates 2>/dev/null || true
+  cp ca.crt ~/runai-ca.crt
+fi
 
-# --- K8s secrets ---
+# --- K8s secrets (delete + recreate to stay in sync with certs on disk) ---
 log "Creating K8s secrets..."
 kubectl delete secret runai-backend-tls runai-ca-cert -n runai-backend 2>/dev/null || true
 kubectl delete secret runai-ca-cert -n runai 2>/dev/null || true
@@ -98,7 +103,11 @@ data:
            ${INGRESS_IP} ${DOMAIN}
            fallthrough
         }
-        kubernetes cluster.local in-addr.arpa ip6.arpa { pods insecure; fallthrough in-addr.arpa ip6.arpa; ttl 30; }
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
         prometheus :9153
         forward . /etc/resolv.conf
         cache 30
@@ -112,7 +121,7 @@ kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || true
 # --- RunAI Helm repos ---
 log "Adding RunAI Helm repos..."
 helm repo add runai-backend https://runai.jfrog.io/artifactory/cp-charts-prod 2>/dev/null || true
-helm repo add runai https://runai.jfrog.io/artifactory/self-hosted-charts-prod 2>/dev/null || true
+helm repo add runai https://runai.jfrog.io/artifactory/api/helm/run-ai-charts --force-update
 helm repo update
 
 log "Prerequisites ready."
