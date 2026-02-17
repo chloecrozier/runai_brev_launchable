@@ -46,12 +46,15 @@ else
 basicConstraints=CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=DNS:${DOMAIN},DNS:*.${DOMAIN}
+subjectAltName=DNS:${DOMAIN},DNS:*.${DOMAIN},DNS:runai-backend-backend.runai-backend.svc,DNS:localhost
 EOF
   openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext 2>/dev/null
   cat server.crt ca.crt > bundle.crt
   sudo cp ca.crt /usr/local/share/ca-certificates/runai-ca.crt && sudo update-ca-certificates 2>/dev/null || true
   cp ca.crt ~/runai-ca.crt
+  # Also copy to the script directory so it's easy to scp from a known path
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cp ca.crt "${SCRIPT_DIR}/runai-ca.crt"
 fi
 
 # --- K8s secrets (delete + recreate to stay in sync with certs on disk) ---

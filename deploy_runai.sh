@@ -44,6 +44,11 @@ helm upgrade -i runai-backend runai-backend/control-plane -n runai-backend \
   --set "global.imagePullSecrets[0].name=runai-reg-creds" \
   --wait --timeout=25m
 
+# Restart control plane pods so they pick up the latest CA secret
+log "Restarting control plane pods..."
+kubectl rollout restart deployment -n runai-backend 2>/dev/null || true
+kubectl rollout restart statefulset -n runai-backend 2>/dev/null || true
+
 # --- Ensure host can resolve the domain ---
 grep -q "${RUNAI_DOMAIN}" /etc/hosts 2>/dev/null || echo "127.0.0.1 ${RUNAI_DOMAIN}" | sudo tee -a /etc/hosts >/dev/null
 
@@ -101,9 +106,10 @@ evalStr=$(echo "${installationStr}" | sed '1,2d' | sed ':a;N;$!ba;s/\n/ /g' | tr
 evalStr=$(echo "${evalStr}" | sed -E 's/helm (upgrade -i|upgrade --install|install) /helm upgrade --install /g')
 [[ "${evalStr}" =~ ^helm[[:space:]] ]] || die "Invalid install command: ${evalStr}"
 
-# The cluster chart reads the CA from secret runai-ca-cert (already created by setup_prereqs).
-# We just need to flip the feature on; the secret name/key defaults match what we created.
+# The cluster chart reads the CA from a K8s secret (created by setup_prereqs).
+# Set enabled + explicit secret name/key so the chart mounts the CA into all pods.
 [[ "${evalStr}" == *"global.customCA.enabled"* ]] || evalStr="${evalStr} --set global.customCA.enabled=true"
+evalStr="${evalStr} --set global.customCA.secret.name=runai-ca-cert --set global.customCA.secret.key=runai-ca.pem"
 
 # Ensure the cluster chart repo exists (JFrog requires auth for cluster charts)
 log "Adding RunAI cluster Helm repo..."
@@ -115,9 +121,28 @@ log "Installing cluster..."
 eval "${evalStr}"
 
 PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "YOUR_PUBLIC_IP")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo ""
-echo "Done! UI: https://${RUNAI_DOMAIN}  (login: ${RUNAI_USERNAME} / ${RUNAI_PASSWORD})"
+echo "====================================================="
+echo " Done! UI: https://${RUNAI_DOMAIN}"
+echo " Login:    ${RUNAI_USERNAME} / ${RUNAI_PASSWORD}"
+echo "====================================================="
 echo ""
-echo "Run this on your LOCAL machine to access the UI:"
+echo "--- LOCAL MACHINE SETUP ---"
 echo ""
-echo "  sudo bash -c 'echo \"${PUBLIC_IP} ${RUNAI_DOMAIN}\" >> /etc/hosts'"
+echo "1. Add DNS entry (one-time):"
+echo "   sudo bash -c 'echo \"${PUBLIC_IP} ${RUNAI_DOMAIN}\" >> /etc/hosts'"
+echo ""
+echo "2. Fix 'Your connection is not private' by installing the CA cert:"
+echo ""
+echo "   # Download the CA cert from the server:"
+echo "   scp $(whoami)@${PUBLIC_IP}:${SCRIPT_DIR}/runai-ca.crt ~/runai-ca.crt"
+echo ""
+echo "   # macOS — add to system keychain:"
+echo "   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/runai-ca.crt"
+echo ""
+echo "   # Linux — add to system trust store:"
+echo "   sudo cp ~/runai-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates"
+echo ""
+echo "   # Firefox — also enable: about:config → security.enterprise_roots.enabled = true"
+echo ""
