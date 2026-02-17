@@ -19,7 +19,7 @@ kubectl wait --for=condition=ready node --all --timeout=60s
 log "Installing Helm..."
 command -v helm &>/dev/null || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
-# --- Ingress (hostNetwork for port 443) ---
+# --- Ingress (hostNetwork so it binds directly to port 443) ---
 log "Installing Ingress..."
 kubectl create ns ingress-nginx 2>/dev/null || true
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/null || true
@@ -40,15 +40,41 @@ if [[ -f "${CERT_DIR}/ca.crt" && -f "${CERT_DIR}/bundle.crt" && -f "${CERT_DIR}/
 else
   log "Generating TLS certificates..."
   rm -rf "${CERT_DIR}" && mkdir -p "${CERT_DIR}" && cd "${CERT_DIR}"
-  openssl req -x509 -new -nodes -days 3650 -newkey rsa:4096 -keyout ca.key -out ca.crt -subj "/CN=RunAI CA" 2>/dev/null
-  openssl req -new -nodes -newkey rsa:2048 -keyout server.key -out server.csr -subj "/CN=${DOMAIN}" 2>/dev/null
-  cat > server.ext <<EOF
-basicConstraints=CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=DNS:${DOMAIN},DNS:*.${DOMAIN},DNS:runai-backend-backend.runai-backend.svc,DNS:localhost
-EOF
-  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext 2>/dev/null
+
+  cat > ca.cnf <<'CAEOF'
+[req]
+default_bits = 4096
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+CN = Run:ai CA
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,digitalSignature,keyCertSign,cRLSign
+CAEOF
+
+  cat > server.cnf <<SRVEOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+req_extensions = v3_req
+[dn]
+CN = ${DOMAIN}
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth,clientAuth
+subjectAltName = DNS:${DOMAIN},DNS:*.${DOMAIN},DNS:runai-backend-backend.runai-backend.svc,DNS:localhost
+SRVEOF
+
+  openssl req -x509 -new -nodes -days 3650 -newkey rsa:4096 -keyout ca.key -out ca.crt -config ca.cnf 2>/dev/null
+  openssl req -new -nodes -newkey rsa:2048 -keyout server.key -out server.csr -config server.cnf 2>/dev/null
+  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out server.crt -days 365 -sha256 -extfile server.cnf -extensions v3_req 2>/dev/null
   cat server.crt ca.crt > bundle.crt
   sudo cp ca.crt /usr/local/share/ca-certificates/runai-ca.crt && sudo update-ca-certificates 2>/dev/null || true
   cp ca.crt ~/runai-ca.crt
@@ -60,10 +86,14 @@ fi
 # --- K8s secrets (delete + recreate to stay in sync with certs on disk) ---
 log "Creating K8s secrets..."
 kubectl delete secret runai-backend-tls runai-ca-cert -n runai-backend 2>/dev/null || true
+kubectl delete configmap runai-ca-bundle -n runai-backend 2>/dev/null || true
 kubectl delete secret runai-ca-cert -n runai 2>/dev/null || true
 kubectl create secret tls runai-backend-tls -n runai-backend --cert=bundle.crt --key=server.key
+kubectl create configmap runai-ca-bundle -n runai-backend --from-file=ca.crt=ca.crt
 kubectl create secret generic runai-ca-cert -n runai-backend --from-file=runai-ca.pem=ca.crt
 kubectl create secret generic runai-ca-cert -n runai --from-file=runai-ca.pem=ca.crt
+kubectl label secret runai-ca-cert -n runai-backend run.ai/cluster-wide=true --overwrite
+kubectl label secret runai-ca-cert -n runai run.ai/cluster-wide=true --overwrite
 
 # --- Prometheus ---
 log "Installing Prometheus..."
